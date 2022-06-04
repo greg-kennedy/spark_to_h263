@@ -5,230 +5,163 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bitstream.h"
+#include "hufftbl.h"
+
 // defines
 #define I_FRAME 0
 #define P_FRAME 1
 
-#define INTRADC 0b1000'00
-#define DQUANT 0b100'00
-#define MVD 0b10'00
-#define MVD24 0b1'00
-#define PADDING 0x80
-#define EOT 0xFF
-
-// tables
-//  huff table format is (len, val, result)
-// some of the val have >8 bits but since the topmost are all 0
-//  they still fit in an unsigned char...
-unsigned char MCBPC_I_HUFF[][3] = {
-    {1, 0b1,INTRADC | 0},
-    {3, 0b001, INTRADC | 1},
-    {3, 0b010, INTRADC | 2},
-    {3, 0b011, INTRADC | 3},
-
-    {4, 0b0001, INTRADC | DQUANT | 0},
-    {6, 0b0000'01, INTRADC | DQUANT | 1},
-    {6, 0b0000'10, INTRADC | DQUANT | 2},
-    {6, 0b0000'11, INTRADC | DQUANT | 3},
-
-    {9, 0b0000'0000'1, PADDING}, // padding
-
-    {EOT, EOT, EOT} // terminator
-};
-
-unsigned char MCBPC_P_HUFF[][3] = {
-    {1, 0b1, MVD | 0},
-    {4, 0b0011, MVD | 1},
-    {4, 0b0010, MVD | 2},
-    {6, 0b0001'01, MVD | 3},
-
-    {3, 0b011, DQUANT | MVD | 0},
-    {7, 0b0000'111, DQUANT | MVD | 1},
-    {7, 0b0000'110, DQUANT | MVD | 2},
-    {9, 0b0000'0010'1, DQUANT | MVD | 3},
-
-    {3, 0b010, MVD | MVD24 | 0},
-    {7, 0b0000'101, MVD | MVD24 | 1},
-    {7, 0b0000'100, MVD | MVD24 | 2},
-    {8, 0b0000'101, MVD | MVD24 | 3},
-
-    {5, 0b0001'1, INTRADC | 0},
-    {8, 0b0000'0100, INTRADC | 1},
-    {8, 0b0000'0011, INTRADC | 2},
-    {7, 0b0000'001, INTRADC | 3},
-
-    {6, 0b0001'00, INTRADC | DQUANT | 0},
-    {9, 0b0000'0010'0, INTRADC | DQUANT | 1},
-    {9, 0b0000'0001'1, INTRADC | DQUANT | 2},
-    {9, 0b0000'0001'0, INTRADC | DQUANT | 3},
-
-    {9, 0b0000'0000'1, PADDING}, // padding
-
-    /* these only exist for AP or Deblock mode */
-    {11, 0b0000'0000'010, DQUANT | MVD | MVD24 | 0},
-    {13, 0b0000'0000'0110'0, DQUANT | MVD | MVD24 | 1},
-    {13, 0b0000'0000'0111'0, DQUANT | MVD | MVD24 | 2},
-    {13, 0b0000'0000'0111'1, DQUANT | MVD | MVD24 | 3},
-
-    {EOT, EOT, EOT} // terminator
-};
-
-unsigned char CBPY_HUFF[][3] = {
-    {4, 0b0011, 0},
-    {5, 0b0010'1, 1},
-    {5, 0b0010'0, 2},
-    {4, 0b1001, 3},
-    {5, 0b0001'1, 4},
-    {4, 0b0111, 5},
-    {6, 0b000010, 6},
-    {4, 0b1011, 7},
-    {5, 0b0001'0, 8},
-    {6, 0b0000'11, 9},
-    {4, 0b0101, 10},
-    {4, 0b1010, 11},
-    {4, 0b0100, 12},
-    {4, 0b1000, 13},
-    {4, 0b0110, 14},
-    {2, 0b11, 15},
-    {EOT, EOT, EOT} // term
-};
-
-// hufftbl lookup
-static int huff_lookup(struct bitstream * bs, unsigned int* tbl[3])
-{
-    int done = 0;
-    int len = 0;
-    int val = 0;
-    while (! done) {
-        // read another bit
-        val = (val << 1) | get_bit(bs);
-        len++;
-
-        // check table for match on len and val
-        int i = 0;
-        done = 1;
-        while (tbl[i][0] != EOT) {
-            if (len == tbl[i][0] && val == tbl[i][1]) return i;
-            if (len < tbl[i][0]) done = 0;
-            i++;
-        }
-    }
-    fprintf(stderr, "hufftbl lookup failed! val=%d, len=%d\n", val, len);
-    return -1;
+#define vlc_read(x, y) { \
+    printf(#x ": "); \
+    x = get_bits(&in, y); \
+    printf(" = %d\n", x); \
+    if (x < 0) return -1; \
 }
 
-// bitstream structs
-struct bitstream
+static int decode_block(struct bitstream* in, struct bitstream* out, unsigned char intradc, unsigned char block_exists, unsigned char flv_version)
 {
-    FILE* fp;
-    unsigned char byte;
-    unsigned char mask;
-};
-
-static int get_bit(struct bitstream * bs)
-{
-    // gets the next bit of FP
-    if (! bs->mask)
-    {
-        // out of bits in byte, need to read next
-        if (fread(&bs->byte, 1, 1, bs->fp) != 1)
-        {
-            if (feof(bs->fp))
-                fprintf(stderr, "at eof\n");
-            else
-                perror("fread");
-            return -1;
-        }
-        bs->mask = 0x80;
+    if (intradc) {
+        printf("  INTRADC: ");
+        copy_bits(in, out, 8);
+        printf("\n");
     }
 
-    int retval = (bs->byte & bs->mask) ? 1 : 0;
-    bs->mask >>= 1;
-    return retval;
-}
+    if (block_exists) {
+        printf("  TCOEF:\n");
+        int last = 0;
+        while (!last) {
+            printf("   TCOEF HUFF: ");
+            int flags = huff_lookup(in, out, TCOEF_HUFF);
+            if (flags < 0) { fprintf(stderr, "TCOEF huff_lookup failed\n"); return -1; }
 
-static int get_bits(struct bitstream * bs, int count)
-{
-    int retval = 0;
-    while (count) {
-        int bit = get_bit(bs);
-        if (bit < 0) return bit;
-        retval = (retval << 1) | bit;
-        count--;
-    }
-    return retval;
-}
+            if (flags == 2) {
+                printf(" (extended range)\n");
+                //                printf("*");
+                                // ESCAPE
+                                //  there are 3 outcomes here depending on flv_version and the first bit
+                                // non-extended-quant-table mode
+                int level_width;
+                if (flv_version == 0)
+                    level_width = 8;
+                else {
+                    printf("  width bit: ");
+                    if (get_bit(in))
+                        level_width = 11;   // extended range level
+                    else
+                        level_width = 7;    // limited range level
+                }
 
-// functions to write to FP
-static int put_bit(struct bitstream* bs, const unsigned int bit)
-{
-    if (bit)
-        bs->byte |= bs->mask;
-    bs->mask >>= 1;
+                // last
+                printf("  last_bit: ");
+                last = copy_bit(in, out);
+                // run
+                printf(", run: ");
+                copy_bits(in, out, 6);
+                // level
+                printf(", level: ");
+                unsigned int level = get_bits(in, level_width);
 
-    if (!bs->mask)
-    {
-        // filled up that byte, need to dump it
-        if (fwrite(&bs->byte, 1, 1, bs->fp) != 1)
-        {
-            perror("fwrite");
-            return -1;
+                // silly sign extension
+                if (level_width == 7) {
+                    level = level | ((level & 0b01000000) ? 0b1111111110000000 : 0);
+                }
+                else if (level_width == 8) {
+                    level = level | ((level & 0b10000000) ? 0b1111111100000000 : 0);
+                }
+                // the h.263 standard is to write 8 bits Level if it's within -127 to 127
+                //  otherwise, write -128, and then 11 bits level
+                if (level <= 0b00001111111 || level >= 0b11110000001) {
+                    put_bits(out, 8, level);
+                }
+                else {
+                    put_bits(out, 8, 0b10000000);
+                    put_bits(out, 5, level & 0b11111);
+                    put_bits(out, 6, (level >> 5) & 0b111111);
+                }
+
+//                if (level == 0)
+//                    fprintf(stderr, "forbidden level\n");
+            }
+            else {
+                last = flags;
+                // copy sign bit
+                copy_bit(in, out);
+            }
+            printf("\n");
         }
-        bs->byte = 0;
-        bs->mask = 0x80;
+    }
+    //    printf("\n");
+    return 0;
+}
+
+static int copy_umv(struct bitstream* in, struct bitstream* out)
+{
+    // default to stuffing needed
+    int stuffing = 1;
+
+    for (int i = 0; i < 2; i++) {
+        printf("  UMV %s: ", (i ? "horiz" : "vert" ));
+        if (!copy_bit(in, out)) {
+            // leading 0
+            //  test for Stuffing bit
+            int val;
+            do {
+                // val
+                val = copy_bits(in, out, 2);
+                if (val) stuffing = 0;
+            } while (val & 1);
+        }
+        else {
+            stuffing = 0;
+        }
+        printf("\n");
+    }
+
+    // six 0 in a row means add 1 stuffing bit
+    if (stuffing) {
+        printf("  (stuffing): ");  copy_bit(in, out); printf("\n");
     }
 
     return 0;
 }
 
-static int put_bits(struct bitstream* bs, const int count, const unsigned int val)
+static int copy_mv(struct bitstream* in, struct bitstream* out)
 {
-    unsigned int mask = 0x01 << (count - 1);
-    while (mask) {
-        if (put_bit(bs, val & mask) < 0) return -1;
-        mask >>= 1;
+    for (int i = 0; i < 2; i++) {
+        printf("  MV %s: ", (i ? "horiz" : "vert"));
+        huff_lookup(in, out, MVD_HUFF);
+        printf("\n");
     }
+
     return 0;
 }
 
-// copy one bit from in to out, and also return the bit
-static int copy_bit(struct bitstream* in, struct bitstream* out)
+// skip bits from in, until a picture header is found
+static int locate_picture(struct bitstream * in)
 {
-    int bit = get_bit(in);
-    if (bit >= 0) put_bit(out, bit);
-    return bit;
-}
-
-// copy bits from in to out, also ret the result
-static int copy_bits(struct bitstream* in, struct bitstream* out, const int count)
-{
-    int bits = get_bits(in, count);
-    if (bits >= 0) put_bits(out, count, bits);
-    return bits;
-}
-
-// copy bits from in to out, until a picture header is found
-static int locate_picture(struct bitstream * in, struct bitstream * out)
-{
+    printf("Searching picture header: ");
     int buffer = get_bits(in, 17);
+    printf(" = %d\n", buffer);
     while (buffer != 1)
     {
-        // write topmost bit
-        put_bit(out, buffer & 0x10000);
+        // check topmost bit
+        if (buffer & 0x10000) { fprintf(stderr, " . WARNING: skipping non-padding bits\n"); }
         // blank it
         buffer &= 0xFFFF;
         // read next one
+        printf("Advance: ");
         int bit = get_bit(in);
+        printf(" = %d\n", bit);
         if (bit < 0) {
             // out of bits on read
-            //  dump remaining to out
-            put_bits(out, buffer, 16);
             return -1;
         }
         else {
             buffer = (buffer << 1) | bit;
         }
     }
+
     return 0;
 }
 
@@ -315,6 +248,7 @@ int main(int argc, char * argv[])
         par = 15;
     }
 
+    // Open input and output files
     in.fp = fopen(path_in, "rb");
     if (!in.fp) {
         perror(path_in);
@@ -332,31 +266,35 @@ int main(int argc, char * argv[])
     out.byte = 0;
 
     // read first bits
-    while (locate_picture(&in, &out) == 0)
+    while (locate_picture(&in) == 0)
     {
         /* picture header */
-        int flv_version = get_bits(&in, 5);
+        int flv_version;
+        vlc_read(flv_version, 5);
         if (flv_version != 0 && flv_version != 1) {
             fprintf(stderr, "Bad FLV verion %d\n", flv_version);
             return -1;
         }
 
-        int picture_number = get_bits(&in, 8); /* picture timestamp */
+        int picture_number; vlc_read(picture_number, 8); /* picture timestamp */
         if (tr > picture_number) {
             // rollover detection for ETR
             etr = (etr + 1) & 0x03;
         }
         tr = picture_number;
-        int format = get_bits(&in, 3);
+
+        int format;
+        vlc_read(format, 3);
+
         int width, height;
         switch (format) {
         case 0:
-            width = get_bits(&in, 8);
-            height = get_bits(&in, 8);
+            vlc_read(width, 8);
+            vlc_read(height, 8);
             break;
         case 1:
-            width = get_bits(&in, 16);
-            height = get_bits(&in, 16);
+            vlc_read(width, 16);
+            vlc_read(height, 16);
             break;
         case 2:
             width = 352;
@@ -388,7 +326,10 @@ int main(int argc, char * argv[])
         }
 
         int p_type, droppable;
-        switch (get_bits(&in, 2))
+        int frame_type;
+        vlc_read(frame_type, 2);
+
+        switch (frame_type)
         {
         case 0:
             // I FRAME
@@ -415,21 +356,23 @@ int main(int argc, char * argv[])
             return -1;
         }
 
-        int deblocking = get_bit(&in);
+        int deblocking;
+        vlc_read(deblocking, 1);
         if (deblocking < 0) {
             fprintf(stderr, "Invalid deblocking bit\n");
             return -1;
         }
 
-        int qscale = get_bits(&in, 5);
+        int qscale;
+        vlc_read(qscale, 5);
         if (qscale < 0) {
             fprintf(stderr, "Bad qscale value %d\n", qscale);
             return -1;
         }
 
-        printf("Frame %04d: flv_ver = %d, fmt = %d (%d x %d), %c%c, deblock = %d, qscale = %d\n",
+        printf("Frame %04d: flv_ver = %d, fmt = %d (%d x %d), %c%c, deblock = %d, qscale = %d\n  file pos = %d, mask = %02x\n",
             (etr << 8) | tr, flv_version, format, width, height, (p_type ? 'P' : 'I'),
-            droppable ? 'D' : ' ', deblocking, qscale);
+            droppable ? 'D' : ' ', deblocking, qscale, ftell(in.fp), in.mask);
 
         // write new header
         //  PSC must be byte-aligned so insert stuffing if mask is nonzero
@@ -462,9 +405,14 @@ int main(int argc, char * argv[])
             // custom PCF
             put_bits(&out, 1, custom_pcf);
             // UMV always 1 on Spark
+//            put_bits(&out, 1, 1);
+            put_bits(&out, 1, 0);
+            // SAC off
+            put_bits(&out, 1, 0);
+            // AP always ON
             put_bits(&out, 1, 1);
-            // SAC, AP, advanced INTRA
-            put_bits(&out, 3, 0);
+            // advanced INTRA always off
+            put_bits(&out, 1, 0);
             // Deblocking mode (annex J)
             put_bits(&out, 1, 0);
 //            put_bits(&out, 1, deblocking);
@@ -515,9 +463,9 @@ int main(int argc, char * argv[])
         }
 
         // UUI (if UFEP)
-        if (! p_type) {
-            put_bits(&out, 2, 1);
-        }
+//        if (! p_type) {
+//            put_bits(&out, 2, 1);
+//        }
 
         // omitting a large number of deselected mode fields here
 
@@ -528,94 +476,99 @@ int main(int argc, char * argv[])
 //        printf("Current position: in = %d, out = %d\n", ftell(in.fp), ftell(out.fp));
         /////////
         /* PEI */
+        printf("PEI: ");
         while (copy_bit(&in, &out)) {
             copy_bits(&in, &out, 8);
         }
+        printf("\n");
+
+        printf(" . MB layer\n");
 
         // macroblock layer
-        for (int y = 0; y < height; y += 16)
+        int mb_count = ((height + 15) / 16) * ((width + 15) / 16);
+        for (int mb = 0; mb < mb_count; mb ++)
         {
-            for (int x = 0; x < width; x += 16)
-            {
-                unsigned char MCBPC;
-                if (!p_type) {
-                    // I FRAME always CODed
-                    int idx = huff_lookup(&in, MCBPC_I_HUFF);
-                    put_bits(&out, MCBPC_I_HUFF[idx][0], MCBPC_I_HUFF[idx][1]);
-                    MCBPC = MCBPC_I_HUFF[idx][2];
-                } else {
-                    // P FRAME maybe CODed
-                    if (copy_bit(&in, &out) == 0) {
-                        continue;
-                    }
-                    int idx = huff_lookup(&in, MCBPC_P_HUFF);
-                    put_bits(&out, MCBPC_P_HUFF[idx][0], MCBPC_P_HUFF[idx][1]);
-                    MCBPC = MCBPC_P_HUFF[idx][2];
-                }
+            printf("MB %d of %d: ", mb, mb_count);
 
-                // other block info follows
-                // CBPY
-                int idx = huff_lookup(&in, CBPY_HUFF);
-                put_bits(&out, CBPY_HUFF[idx][0], CBPY_HUFF[idx][1]);
-                int CBPY = CBPY_HUFF[idx][2];
-                if (p_type) CBPY = (CBPY ^ 0b11) & 0b11;
-
-                // DQUANT
-                //  note that this uses the Annex T spec for variable len DQUANT
-                if (MCBPC & DQUANT) {
-                    unsigned int dq_bit = get_bit(&in);
-                    put_bit(&out, dq_bit);
-                    if (dq_bit) {
-                        put_bits(&out, 5, get_bits(&in, 5));
-                    }
-                    else {
-                        put_bit(&out, get_bit(&in));
-                    }
+            int MCBPC;
+            if (!p_type) {
+                // I FRAME always CODed
+                printf(" MCBPC I: ");
+                MCBPC = huff_lookup(&in, &out, MCBPC_I_HUFF);
+            } else {
+                // P FRAME maybe CODed
+                printf(" COD: ");
+                if (copy_bit(&in, &out) == 1) {
+                    printf("\n");
+                    continue;
                 }
-
-                if (MCBPC & MVD) {
-                    // motion vectors - this is UMV mode
-                    // horiz
-                    if (!copy_bit(&in, &out)) {
-                        do {
-                            copy_bit(&in, &out);
-                        } while (copy_bit(&in, &out));
-                    }
-                    // vert
-                    if (!copy_bit(&in, &out)) {
-                        do {
-                            copy_bit(&in, &out);
-                        } while (copy_bit(&in, &out));
-                    }
-                }
-                if (MCBPC & MVD24) {
-                    // MVD2-4
-                    // screw it
-                    fprintf(stderr, "Giving up at MVD2-4 haha\n");
-                    return EXIT_FAILURE;
-                }
-
-                // BLOCK LAYER
-                // 4x luma
-                for (int i = 0; i < 4; i++) {
-                    if (MCBPC & INTRADC)
-                        copy_bits(&in, &out, 8);
-                    if (CBPY & (1 << i)) {
-                        // TCOEF
-                    }
-                }
-                // 2x chroma
-                for (int i = 0; i < 2; i++) {
-                    if (MCBPC & INTRADC)
-                        copy_bits(&in, &out, 8);
-                    if (MCBPC & (1 << i)) {
-                        // TCOEF
-                    }
-                }
-
+                printf("\n");
+                printf(" MCBPC P: ");
+                MCBPC = huff_lookup(&in, &out, MCBPC_P_HUFF);
             }
             printf("\n");
+
+            if (MCBPC < 0) { fprintf(stderr, "MCBPC huff_lookup failed\n"); return EXIT_FAILURE; }
+
+            // other block info follows
+            // CBPY
+            printf(" CBPY: ");
+            int CBPY = huff_lookup(&in, &out, CBPY_HUFF);
+            printf("\n");
+            if (CBPY < 0) { fprintf(stderr, "CBPY huff_lookup failed\n"); return EXIT_FAILURE; }
+
+            if (! (MCBPC & INTRADC)) CBPY = CBPY ^ 0b1111;
+
+            // DQUANT
+            //  note that this uses the Annex T spec for variable len DQUANT
+            if (MCBPC & DQUANT) {
+                printf(" DQUANT: ");
+                unsigned int dq_bit = copy_bit(&in, &out);
+                if (dq_bit) {
+                    put_bits(&out, 5, get_bits(&in, 5));
+                }
+                else {
+                    put_bit(&out, get_bit(&in));
+                }
+                printf("\n");
+            }
+
+            if (MCBPC & MVD) {
+                // motion vectors - this is UMV mode
+                printf(" MVD0:\n");
+                copy_mv(&in, &out);
+//                copy_umv(&in, &out);
+            }
+
+            if (MCBPC & MVD24) {
+                // MVD2-4
+                for (int i = 1; i < 4; i++)
+                {
+                    printf(" MVD%d:\n", i);
+                    copy_mv(&in, &out);
+//                    copy_umv(&in, &out);
+                }
+            }
+
+            // BLOCK LAYER
+            // 4x luma
+            for (int i = 0; i < 4; i++) {
+                if ((MCBPC & INTRADC) || (CBPY & (0b1000 >> i))) {
+                    printf(" LUMA%d\n", i);
+                    if (decode_block(&in, &out, MCBPC & INTRADC, CBPY & (0b1000 >> i), flv_version) < 0)
+                        return EXIT_FAILURE;
+                }
+            }
+            // 2x chroma
+            for (int i = 0; i < 2; i++) {
+                if ((MCBPC & INTRADC) || (MCBPC & (0b10 >> i))) {
+                    printf(" CHROMA%d\n", i);
+                    if (decode_block(&in, &out, MCBPC & INTRADC, MCBPC & (0b10 >> i), flv_version) < 0)
+                        return EXIT_FAILURE;
+                }
+            }
         }
+        printf("\n");
     }
 
     // have to write the remaining byte from out and close files
@@ -631,14 +584,3 @@ int main(int argc, char * argv[])
 
     return 0;
 }
-
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
-
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
